@@ -22,6 +22,7 @@ REQUIREMENTS  (one-time setup — see README.txt for step-by-step help)
 import sys
 import os
 import io
+import time
 import base64
 import math
 import webbrowser
@@ -46,12 +47,33 @@ try:
 except ImportError:
     _missing.append("matplotlib")
 
+# curl_cffi lets us impersonate a real Chrome browser when calling Yahoo.
+# This is what keeps the rich "info" data flowing from cloud servers (Render
+# etc.), where Yahoo otherwise rate-limits (HTTP 429) and returns blanks.
+# It's optional: if it's missing, we fall back to yfinance's default session.
+try:
+    from curl_cffi import requests as _curl_requests
+except ImportError:
+    _curl_requests = None
+
 if _missing:
     print("\n  Stock Lens needs a few free Python packages that aren't installed yet.")
     print("  Please run this command in your terminal, then run Stock Lens again:\n")
     print("      pip install " + " ".join(_missing) + "\n")
     print("  (If 'pip' isn't found, try 'pip3' or 'python -m pip install ...')\n")
     sys.exit(1)
+
+
+def _new_session():
+    """A browser-impersonating session (Chrome) to avoid Yahoo rate limits.
+    Returns None if curl_cffi isn't installed, in which case yfinance uses
+    its own default session."""
+    if _curl_requests is None:
+        return None
+    try:
+        return _curl_requests.Session(impersonate="chrome")
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -133,17 +155,31 @@ def esc(s):
 # ============================================================
 def fetch_all(ticker):
     """Pull everything we can from yfinance. Returns a dict; missing pieces are None."""
-    tk = yf.Ticker(ticker)
-    data = {"ticker": ticker.upper(), "errors": []}
+    session = _new_session()                       # Chrome-impersonating session (or None)
+    tk = yf.Ticker(ticker, session=session) if session else yf.Ticker(ticker)
+    data = {"ticker": ticker.upper(), "errors": [], "_session": session}
 
-    def tryget(label, fn):
-        try:
-            return fn()
-        except Exception as e:  # noqa: BLE001 — we want to survive any single failure
-            data["errors"].append(f"{label}: {e}")
-            return None
+    def tryget(label, fn, retries=0):
+        for attempt in range(retries + 1):
+            try:
+                return fn()
+            except Exception as e:  # noqa: BLE001 — we want to survive any single failure
+                if attempt < retries:
+                    time.sleep(0.8 * (attempt + 1))   # brief backoff, then retry
+                    continue
+                data["errors"].append(f"{label}: {e}")
+                return None
 
-    data["info"] = tryget("info", lambda: tk.info) or {}
+    # `info` is the big one Yahoo rate-limits most, so give it a couple of retries.
+    info = tryget("info", lambda: tk.info, retries=2)
+    if not info:
+        # one more try with a fresh impersonating session
+        s2 = _new_session()
+        if s2:
+            tk = yf.Ticker(ticker, session=s2)
+            data["_session"] = s2
+            info = tryget("info (retry)", lambda: tk.info, retries=1)
+    data["info"] = info or {}
     data["hist"] = tryget("price history", lambda: tk.history(period="2y", interval="1d"))
     data["income"] = tryget("income statement", lambda: tk.income_stmt)
     data["balance"] = tryget("balance sheet", lambda: tk.balance_sheet)
@@ -156,7 +192,8 @@ def fetch_all(ticker):
     data["upgrades"] = tryget("analyst actions", lambda: tk.upgrades_downgrades)
     data["calendar"] = tryget("calendar", lambda: tk.calendar)
     # --- industry peers, for relative ("vs industry") analysis ---
-    data["peers"] = tryget("industry peers", lambda: fetch_peers(data["info"]))
+    data["peers"] = tryget("industry peers", lambda: fetch_peers(data["info"], data.get("_session")))
+    data.pop("_session", None)  # don't keep the session object in the result
     return data
 
 
@@ -167,7 +204,7 @@ PEER_METRICS = ["grossMargins", "operatingMargins", "profitMargins", "returnOnEq
                 "earningsGrowth", "debtToEquity", "currentRatio"]
 
 
-def fetch_peers(info):
+def fetch_peers(info, session=None):
     """Fetch same-industry peers and the median of each comparable metric.
     Returns {'name': industry_name, 'medians': {key: median}, 'n': count, 'tickers': [...]}.
     Designed to fail soft: returns None on any problem, capped in time."""
@@ -178,7 +215,7 @@ def fetch_peers(info):
     if not ind_key:
         return None
     try:
-        ind = yf.Industry(ind_key)
+        ind = yf.Industry(ind_key, session=session) if session else yf.Industry(ind_key)
         top = ind.top_companies
         ind_name = ind.name or info.get("industry") or ""
     except Exception:
@@ -195,13 +232,16 @@ def fetch_peers(info):
 
     def one(sym):
         try:
-            pinfo = yf.Ticker(sym).info
+            # each thread uses its own impersonating session to avoid 429s
+            s = _new_session()
+            pt = yf.Ticker(sym, session=s) if s else yf.Ticker(sym)
+            pinfo = pt.info
             return {k: pinfo.get(k) for k in PEER_METRICS}
         except Exception:
             return None
 
     try:
-        with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        with cf.ThreadPoolExecutor(max_workers=6) as ex:
             futs = [ex.submit(one, s) for s in syms]
             for fu in cf.as_completed(futs, timeout=25):
                 r = fu.result()
