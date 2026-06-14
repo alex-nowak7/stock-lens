@@ -4,3 +4,5 @@ yfinance>=0.2.50
 pandas>=2.2
 matplotlib>=3.8
 curl_cffi>=0.7
+requests>=2.31
+python-dotenv>=1.0
