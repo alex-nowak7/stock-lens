@@ -56,6 +56,8 @@ try:
 except ImportError:
     _curl_requests = None
 
+import finnhub_client
+
 if _missing:
     print("\n  Stock Lens needs a few free Python packages that aren't installed yet.")
     print("  Please run this command in your terminal, then run Stock Lens again:\n")
@@ -154,46 +156,42 @@ def esc(s):
 #  DATA FETCH  — every piece wrapped so one failure can't kill the report
 # ============================================================
 def fetch_all(ticker):
-    """Pull everything we can from yfinance. Returns a dict; missing pieces are None."""
-    session = _new_session()                       # Chrome-impersonating session (or None)
+    """Pull everything we can. Finnhub handles the heaviest calls (info, peers,
+    recommendations, insider transactions) so they no longer hit Yahoo's per-IP
+    rate limit. yfinance still handles the lighter calls (price history,
+    financial statements, holders, calendar). Returns a dict; missing pieces are None."""
+    session = _new_session()
     tk = yf.Ticker(ticker, session=session) if session else yf.Ticker(ticker)
-    data = {"ticker": ticker.upper(), "errors": [], "_session": session}
+    data = {"ticker": ticker.upper(), "errors": []}
 
     def tryget(label, fn, retries=0):
         for attempt in range(retries + 1):
             try:
                 return fn()
-            except Exception as e:  # noqa: BLE001 — we want to survive any single failure
+            except Exception as e:  # noqa: BLE001
                 if attempt < retries:
-                    time.sleep(0.8 * (attempt + 1))   # brief backoff, then retry
+                    time.sleep(0.8 * (attempt + 1))
                     continue
                 data["errors"].append(f"{label}: {e}")
                 return None
 
-    # `info` is the big one Yahoo rate-limits most, so give it a couple of retries.
-    info = tryget("info", lambda: tk.info, retries=2)
-    if not info:
-        # one more try with a fresh impersonating session
-        s2 = _new_session()
-        if s2:
-            tk = yf.Ticker(ticker, session=s2)
-            data["_session"] = s2
-            info = tryget("info (retry)", lambda: tk.info, retries=1)
-    data["info"] = info or {}
-    data["hist"] = tryget("price history", lambda: tk.history(period="2y", interval="1d"))
-    data["income"] = tryget("income statement", lambda: tk.income_stmt)
-    data["balance"] = tryget("balance sheet", lambda: tk.balance_sheet)
-    data["cashflow"] = tryget("cash flow", lambda: tk.cashflow)
-    data["recs"] = tryget("recommendations", lambda: tk.recommendations)
-    data["targets"] = tryget("price targets", lambda: tk.analyst_price_targets)
-    data["inst"] = tryget("institutional holders", lambda: tk.institutional_holders)
-    data["major"] = tryget("major holders", lambda: tk.major_holders)
-    data["insider"] = tryget("insider transactions", lambda: tk.insider_transactions)
-    data["upgrades"] = tryget("analyst actions", lambda: tk.upgrades_downgrades)
-    data["calendar"] = tryget("calendar", lambda: tk.calendar)
-    # --- industry peers, for relative ("vs industry") analysis ---
-    data["peers"] = tryget("industry peers", lambda: fetch_peers(data["info"], data.get("_session")))
-    data.pop("_session", None)  # don't keep the session object in the result
+    # ---- FINNHUB: replaces the heavy yfinance calls that get rate-limited ----
+    data["info"]    = tryget("info",                  lambda: finnhub_client.get_info(ticker)) or {}
+    data["recs"]    = tryget("recommendations",       lambda: finnhub_client.get_recommendations(ticker))
+    data["insider"] = tryget("insider transactions",  lambda: finnhub_client.get_insider_transactions(ticker))
+    data["peers"]   = tryget("industry peers",        lambda: finnhub_client.get_peer_data(data["info"]))
+
+    # ---- YFINANCE: lighter calls that aren't typically rate-limited ----
+    data["hist"]     = tryget("price history",        lambda: tk.history(period="2y", interval="1d"))
+    data["income"]   = tryget("income statement",     lambda: tk.income_stmt)
+    data["balance"]  = tryget("balance sheet",        lambda: tk.balance_sheet)
+    data["cashflow"] = tryget("cash flow",            lambda: tk.cashflow)
+    data["targets"]  = tryget("price targets",        lambda: tk.analyst_price_targets)
+    data["inst"]     = tryget("institutional holders", lambda: tk.institutional_holders)
+    data["major"]    = tryget("major holders",        lambda: tk.major_holders)
+    data["upgrades"] = tryget("analyst actions",      lambda: tk.upgrades_downgrades)
+    data["calendar"] = tryget("calendar",             lambda: tk.calendar)
+
     return data
 
 
